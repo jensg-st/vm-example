@@ -1,0 +1,45 @@
+description: Workflow creates the key-pair and security group
+functions:
+- id: aws
+  image: direktiv/aws-cli
+  type: knative-workflow
+states:
+- id: delete
+  type: action
+  action:
+    function: aws
+    secrets: ["aws_key", "aws_secret"]
+    input: 
+      access-key: jq(.secrets.aws_key)
+      secret-key: jq(.secrets.aws_secret)
+      region: us-west-1
+      continue: true
+      commands: 
+        - ec2 delete-security-group --group-name direktiv-security
+        - ec2 delete-key-pair --key-name direktiv-security
+  transition: prepare
+- id: prepare 
+  type: action
+  action:
+    function: aws
+    secrets: ["aws_key", "aws_secret"]
+    input: 
+      access-key: jq(.secrets.aws_key)
+      secret-key: jq(.secrets.aws_secret)
+      region: us-west-1
+      commands: 
+        - ec2 create-security-group --group-name direktiv-security --description direktiv-security
+        - ec2 create-key-pair --key-name direktiv-security 
+        - ec2 authorize-security-group-ingress --group-name direktiv-security --cidr 0.0.0.0/0 --protocol tcp --port 443
+        - ec2 authorize-security-group-ingress --group-name direktiv-security --cidr 0.0.0.0/0 --protocol tcp --port 80
+        - ec2 authorize-security-group-ingress --group-name direktiv-security --cidr 0.0.0.0/0 --protocol tcp --port 22
+  transition: save
+- id: save
+  type: setter
+  variables:
+    - key: direktiv_ssh
+      scope: namespace
+      value: jq(.return[1].data.KeyMaterial | @base64)
+      mimeType: application/octet-stream
+  transform:
+    key: jq(.return[1].data.KeyMaterial)

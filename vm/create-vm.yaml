@@ -1,0 +1,75 @@
+description: creates a brand new VM on AWS
+functions:
+- id: aws
+  image: direktiv/aws-cli
+  type: knative-workflow
+- id: delete
+  workflow: /vm/modify-vm
+  type: subflow
+- id: scp
+  image: direktiv/sshscp:v3
+  type: reusable
+states:
+
+- id: validate
+  type: validate
+  schema:
+    title: Files
+    type: object
+    required:
+      - name
+    properties:
+      name:
+        type: string
+      size:
+        type: string
+        default: m5.large
+  transition: userdata
+
+# get userdata script
+- id: userdata
+  type: getter
+  variables:
+  - scope: workflow
+    key: userdata.sh
+  transform: 
+    userdata: jq(.var."userdata.sh")
+    size: jq(.size // "m5.large")
+    name: jq(.name)
+    ami: ami-04a50faf2a2ec1901
+    disk: 100
+  transition: create
+
+# create VM
+- id: create
+  type: action
+  action:
+    secrets: ["aws_key", "aws_secret"]
+    function: aws
+    input: 
+      access-key: jq(.secrets.aws_key)
+      secret-key: jq(.secrets.aws_secret)
+      region: us-west-1
+      commands: 
+        - ec2 run-instances --block-device-mapping DeviceName=/dev/xvda,Ebs={VolumeSize=jq(.disk)} --user-data jq(.userdata) --key-name direktiv-security --count 1 --instance-type jq(.size) --image-id jq(.ami)
+          --tag-specifications ResourceType=instance,Tags=[{Key=name,Value=jq(.name)}] --security-groups direktiv-security
+        - ec2 wait instance-running --filters Name=tag:name,Values=jq(.name) Name=instance-state-name,Values=pending,running
+        - ec2 describe-instances --filters Name=tag:name,Values=jq(.name) Name=instance-state-name,Values=pending,running --max-items 1
+  catch:
+  - error: "*"
+    transition: cleanup
+
+# catch path, delete vm if created
+- id: cleanup
+  type: action
+  action:
+    function: delete
+    input:
+      name: jq(.name)
+      action: terminate-instances
+  transition: error
+- id: error
+  type: error
+  log: error creating vm jq(.error)
+  error: vm.failed
+  message: "failed to create vm jq(.name): jq(.error)"

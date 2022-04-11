@@ -1,0 +1,58 @@
+states:
+- id: validate
+  type: validate
+  schema:
+    type: object
+    properties:
+      name:
+        type: string
+      size:
+        type: string
+        default: m5.large
+        enum: ["m5.large", "m5.xlarge", "m5.2xlarge", "m5.4xlarge"]
+      finish:
+        type: string
+        enum: ["stop-instances", "terminate-instances"]
+        default: terminate-instances
+  transition: defaults
+- id: defaults
+  type: noop
+  transform: |
+    js(
+      if (!data["name"]) {
+            data["name"] = (Math.random() + 1).toString(36).substring(7)
+      }
+      return data
+    )
+  transition: generate
+- id: generate
+  type: generateEvent
+  log: requesting vm jq(.name)
+  event:
+    type: vm.request
+    source: app-starter
+    context:
+      name: jq(.name)
+      size: jq(.size // "m5.large")
+      finish: jq(.finish // "terminate-instances")
+  transition: wait
+- id: wait
+  type: consumeEvent
+  log: waiting for vm jq(.name) to be ready
+  event:
+    type: vm.ready
+    context:
+      name: jq(.name)
+  transition: do-some-work
+- id: do-some-work
+  type: delay
+  duration: PT60S
+  transition: finish
+- id: finish
+  type: generateEvent
+  log: notify finish vm jq(.name)
+  event:
+    type: vm.finish
+    source: app-starter
+    context:
+      name: jq(.name)

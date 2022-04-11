@@ -1,0 +1,190 @@
+description: Starts a VM if it exists or creates new one
+timeouts:
+  interrupt: PT1H
+  kill: PT2H
+functions:
+- id: aws
+  image: direktiv/aws-cli
+  type: knative-workflow
+- id: create
+  workflow: /vm/create-vm
+  type: subflow
+- id: modify
+  workflow: /vm/modify-vm
+  type: subflow
+- id: scp
+  image: direktiv/sshscp:v3
+  type: knative-workflow
+
+# waits for events like this
+# {
+#     "specversion" : "1.0",
+#     "type" : "vm.request",
+#     "source" : "myapp"
+# }
+start:
+  type: event
+  state: defaults
+  event:
+    type: vm.request
+
+# setting defaults
+states:
+- id: defaults
+  type: noop
+  log: performing input test
+  transform:
+    name: | 
+      js(
+        if (!data["vm.request"]["name"]) {
+          return (Math.random() + 1).toString(36).substring(7)
+        }
+        return data["vm.request"]["name"]
+      )
+    size: jq(."vm.request".size // "m5.large")
+    finish: jq(."vm.request".finish // "terminate-instances")
+  transition: check-vm
+
+# check if VM exists in any state
+- id: check-vm 
+  type: action
+  action:
+    function: aws
+    secrets: ["aws_key", "aws_secret"]
+    input: 
+      print: false
+      access-key: jq(.secrets.aws_key)
+      secret-key: jq(.secrets.aws_secret)
+      region: us-west-1
+      commands: 
+        - ec2 describe-instances --filters Name=tag:name,Values=jq(.name)
+  transform: 
+    name: jq(.name)
+    size: jq(.size)
+    finish: jq(.finish)
+    status: | 
+      js(
+        let running = 0;
+        let stopped = 0;
+        instances = data["return"][0].data.Reservations;
+        instances.forEach((instance) => {
+            if (instance.Instances[0].State.Name == "running" || instance.Instances[0].State.Name == "pending") {
+              running++;
+            } else if (instance.Instances[0].State.Name == "stopping" || instance.Instances[0].State.Name == "stopped") {
+              stopped++;
+            }
+        });
+        return {running:running, stopped:stopped};
+      )
+  transition: decide
+- id: decide
+  type: switch
+  conditions:
+    - condition: jq(.status.running == 1) # we just wait for it, can be pending
+      transition: wait
+    - condition: jq(.status.stopped == 1) # start and wait for it
+      transition: start
+    - condition: jq(.status.running == 0 and .status.stopped == 0) # lets create one
+      transition: create  
+  defaultTransition: finish
+
+- id: create
+  type: action
+  log: creating VM jq(.name)
+  action:
+    function: create
+    input:
+      name: jq(.name)
+      size: jq(.size) 
+  transform: 'jq(. + { info: .return })'
+  transition: wait
+
+- id: start
+  type: action
+  log: starting instance jq(.name)
+  action:
+    function: modify
+    input:
+      name: jq(.name)
+      action: start-instances
+  transition: wait
+
+# this happens after starting or on a started vm
+- id: wait 
+  type: action
+  log: waiting for instance jq(.name)
+  action:
+    function: aws
+    secrets: ["aws_key", "aws_secret"]
+    input:
+      print: false
+      access-key: jq(.secrets.aws_key)
+      secret-key: jq(.secrets.aws_secret)
+      region: us-west-1
+      commands: 
+        - ec2 wait instance-running --filters Name=tag:name,Values=jq(.name) Name=instance-state-name,Values=pending,running
+        - ec2 describe-instances --filters Name=tag:name,Values=jq(.name) Name=instance-state-name,Values=pending,running --max-items 1
+  transform:
+    info:
+      ip: jq(.return[1].data.Reservations[0].Instances[0].PublicIpAddress)
+      dns: jq(.return[1].data.Reservations[0].Instances[0].PublicDnsName)
+    size: jq(.size)
+    name: jq(.name)
+    finish: jq(.finish)
+  transition: ssh-loop
+
+# ssh in, if it works we are done
+- id: ssh-loop
+  type: action
+  log: jq(.)
+  action:
+    function: scp
+    retries:
+      max_attempts: 30
+      delay: PT10S
+      codes: [".*"]
+    input: 
+      actions:
+        - type: ssh
+          host: ec2-user@jq(.info.ip)
+          auth: direktiv-cert.pem
+          files:
+          - name: direktiv-cert.pem
+            type: var
+            data: namespace/direktiv_ssh
+          - type: plain
+            data: | 
+              # wait till k3s is installed
+              while [ ! -f /etc/rancher/k3s/k3s.yaml ]; do sleep 1; done
+  transition: publish
+
+- id: publish
+  type: generateEvent
+  log: generating event for consumers
+  event:
+    type: vm.ready
+    source: vm-creator
+    context:
+      name: jq(.name)
+      dns: jq(.info.dns)
+      ip: jq(.info.ip)
+  transition: wait-for-shutdown
+
+- id: wait-for-shutdown
+  type: consumeEvent
+  log: waiting for shutdown vm.finish event for jq(.name)
+  timeout: PT1H
+  event:
+    type: vm.finish
+    context:
+      name: jq(.name)
+  transition: finish
+
+- id: finish
+  type: action
+  log: executing jq(.finish) on jq(.name)
+  action:
+    function: modify
+    input: 
+      name: jq(.name)
+      action: jq(.finish)

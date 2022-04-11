@@ -1,0 +1,75 @@
+description: modify state of vm
+functions:
+- id: aws
+  image: direktiv/aws-cli
+  type: knative-workflow
+states:
+- id: validate
+  type: validate
+  schema:
+    title: Action VMs
+    type: object
+    required:
+      - action
+      - name
+    properties:
+      name:
+        type: string
+      action:
+        type: string
+        enum: ["stop-instances", "start-instances", "terminate-instances"]
+        default: stop-instances
+  transition: default
+- id: default
+  type: noop
+  transform:
+    name: jq(.name)
+    action: jq(.action)
+  transition: modify
+- id: modify
+  type: action
+  log: running jq(.action) on name 'jq(.name)''
+  transform: 
+    name: jq(.name)
+  action:
+    function: aws
+    secrets: ["aws_key", "aws_secret"]
+    input: 
+      access-key: jq(.secrets.aws_key)
+      secret-key: jq(.secrets.aws_secret)
+      region: us-west-1
+      script:
+          data: |
+            filter="Name=tag:name,Values=jq(.name)"
+ 
+            cmd="instance-terminated"
+            fullFilter="Name=instance-state-name,Values=stopping,stopped,shutting-down,running,pending"
+            if [[ "jq(.action)" = "start-instances" ]]; then
+              fullFilter="Name=instance-state-name,Values=stopping,stopped,shutting-down"
+              cmd="instance-running"
+            elif [[ "jq(.action)" = "stop-instances" ]]; then
+              fullFilter="Name=instance-state-name,Values=running,pending"
+              cmd="instance-stopped"
+            fi
+
+            echo aws ec2 describe-instances --filters $fullFilter $filter --query Reservations[].Instances[].InstanceId --output text
+            aws ec2 describe-instances --filters $fullFilter $filter --query Reservations[].Instances[].InstanceId --output text
+
+            id=`aws ec2 describe-instances --filters $fullFilter $filter --query Reservations[].Instances[].InstanceId --output text`
+            if [[ ! -z "${id}" ]]
+            then
+               echo "jq(.action) on instance id $id"; 
+               aws ec2 jq(.action) --instance-ids $id 2>&1 > /dev/null; 
+               aws ec2 wait $cmd --instance-ids $id 2>&1 > /dev/null; 
+            fi
+          type: plain
+
+
+
+# .return[2].data.Reservations[0].Instances[0].NetworkInterfaces[0].PrivateIpAddresses[0].Association
+
+# {
+#   "IpOwnerId": "amazon",
+#   "PublicDnsName": "ec2-54-215-255-20.us-west-1.compute.amazonaws.com",
+#   "PublicIp": "54.215.255.20"
+# }
